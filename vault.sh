@@ -11,6 +11,15 @@ print_message() {
 print_message "Updating system packages"
 sudo dnf update -y
 
+# Step 1: Install AWS CLI
+print_message "Installing AWS CLI"
+sudo dnf install -y aws-cli
+
+# Verify AWS CLI Installation
+print_message "Verifying AWS CLI installation"
+aws --version || { echo "❌ AWS CLI installation failed"; exit 1; }
+
+
 print_message "Installing required dependencies"
 sudo dnf install -y yum-utils
 
