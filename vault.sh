@@ -116,11 +116,15 @@ read -p "Enter AWS Access Key: " AWS_ACCESS_KEY
 read -sp "Enter AWS Secret Key: " AWS_SECRET_KEY
 echo ""
 
+# Prompt for AWS Account Number
+read -p "Enter AWS Account Number: " AWS_ACCOUNT_NUMBER
+
 print_message "Configuring AWS Secrets Engine"
 vault write aws/config/root \
     access_key="$AWS_ACCESS_KEY" \
     secret_key="$AWS_SECRET_KEY" \
-    region="us-east-1"
+    region="us-east-1" \
+    role_arn="arn:aws:iam::$AWS_ACCOUNT_NUMBER:role/VaultAccessRole"
 
 print_message "Retrieving Public IP"
 PUBLIC_IP=$(curl -s ifconfig.me)
