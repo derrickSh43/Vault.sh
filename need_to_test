@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# Exit on error
+set -e
+
+# Print messages
+print_message() {
+    echo -e "\n🔹 $1..."
+}
+
+# Check if command exists
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+print_message "Updating system packages"
+sudo dnf update -y
+
+print_message "Installing dependencies"
+sudo dnf install -y awscli yum-utils jq curl
+
+print_message "Adding HashiCorp repository"
+sudo yum-config-manager --add-repo https://rpm.releases.hashicorp.com/AmazonLinux/hashicorp.repo
+
+print_message "Installing Vault"
+sudo dnf install -y vault
+if ! command_exists vault; then
+    echo "❌ Vault installation failed"
+    exit 1
+fi
+vault --version
+
+print_message "Creating Vault directories"
+sudo mkdir -p /etc/vault /opt/vault/data
+sudo chown vault:vault /opt/vault/data
+
+print_message "Configuring Vault"
+cat <<EOF | sudo tee /etc/vault/config.hcl
+storage "file" {
+  path = "/opt/vault/data"
+}
+listener "tcp" {
+  address     = "0.0.0.0:8200"
+  tls_disable = "true"
+}
+disable_mlock = true
+ui = true
+EOF
+sudo chown vault:vault /etc/vault/config.hcl
+sudo chmod 640 /etc/vault/config.hcl
+
+print_message "Setting up Vault systemd service"
+cat <<EOF | sudo tee /etc/systemd/system/vault.service
+[Unit]
+Description=Vault Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/vault server -config=/etc/vault/config.hcl
+Restart=always
+User=vault
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable vault
+sudo systemctl start vault
+
+print_message "Waiting for Vault to start"
+sleep 5
+if ! systemctl is-active --quiet vault; then
+    echo "❌ Vault failed to start"
+    journalctl -u vault -n 50
+    exit 1
+fi
+
+print_message "Setting Vault address"
+export VAULT_ADDR="http://127.0.0.1:8200"
+
+print_message "Checking Vault status"
+vault status || { echo "❌ Vault not responding"; exit 1; }
+
+print_message "Initializing Vault if needed"
+if ! vault status | grep -q "Initialized.*true"; then
+    vault operator init -format=json > vault_init.json
+    vault operator unseal $(jq -r '.unseal_keys_b64[0]' vault_init.json)
+    vault operator unseal $(jq -r '.unseal_keys_b64[1]' vault_init.json)
+    vault operator unseal $(jq -r '.unseal_keys_b64[2]' vault_init.json)
+    export VAULT_TOKEN=$(jq -r '.root_token' vault_init.json)
+    echo "Root token stored in vault_init.json - secure it!"
+else
+    echo "Vault already initialized - please provide root token if needed"
+    read -sp "Enter Vault root token: " VAULT_TOKEN
+    echo
+    export VAULT_TOKEN
+fi
+
+print_message "Enabling AWS secrets engine"
+vault secrets enable -path=aws aws || echo "AWS secrets engine already enabled"
+
+print_message "Configuring AWS secrets engine"
+read -p "Enter AWS Access Key: " AWS_ACCESS_KEY
+read -sp "Enter AWS Secret Key: " AWS_SECRET_KEY
+echo
+vault write aws/config/root \
+    access_key="$AWS_ACCESS_KEY" \
+    secret_key="$AWS_SECRET_KEY" \
+    region="us-east-1"
+
+print_message "Setting up AWS role"
+vault write aws/roles/jenkins-role \
+    credential_type=assumed_role \
+    role_arns="arn:aws:iam::182399711649:role/VaultAccessRole"
+
+print_message "Enabling AppRole auth"
+vault auth enable approle || echo "AppRole already enabled"
+
+print_message "Creating Jenkins policy"
+vault policy write jenkins-policy -<<EOF
+path "aws/creds/jenkins-role" {
+    capabilities = ["read"]
+}
+path "secret/data/*" {
+    capabilities = ["create", "update", "read"]
+}
+path "secret/metadata/*" {
+    capabilities = ["list"]
+}
+EOF
+
+print_message "Setting up Jenkins AppRole"
+vault write auth/approle/role/jenkins-role \
+    token_policies="default,jenkins-policy" \
+    token_ttl=1h \
+    token_max_ttl=4h
+ROLE_ID=$(vault read -field=role_id auth/approle/role/jenkins-role/role-id)
+SECRET_ID=$(vault write -f -field=secret_id auth/approle/role/jenkins-role/secret-id)
+echo "ROLE_ID: $ROLE_ID"
+echo "SECRET_ID: $SECRET_ID"
+echo "Store these securely in Jenkins credentials!"
+
+print_message "Setup complete!"
